@@ -202,6 +202,15 @@ def test_test_stdout():
         """).strip().encode('utf-8')
 
 
+def test_test_log():
+    stream = StreamStub()
+    messages = TeamcityServiceMessages(output=stream, now=lambda: fixed_date)
+    messages.message('testLog', name='only a test', out='out')
+    assert stream.observed_output.strip() == textwrap.dedent("""\
+        ##teamcity[testLog timestamp='2000-11-02T10:23:01.556' name='only a test' out='out']
+        """).strip().encode('utf-8')
+
+
 def test_test_stderr():
     stream = StreamStub()
     messages = TeamcityServiceMessages(output=stream, now=lambda: fixed_date)
