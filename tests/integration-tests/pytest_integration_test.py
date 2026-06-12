@@ -2,6 +2,7 @@
 import contextlib
 import os
 import platform
+import subprocess
 import sys
 
 import pytest
@@ -39,10 +40,20 @@ def fix_slashes(s):
 @contextlib.contextmanager
 def make_ini(content):
     path = os.path.join(get_teamcity_messages_root(), 'pytest.ini')
-    with open(path, 'w+') as f:
-        f.write(content)
-    yield
-    os.remove(path)
+    previous_content = None
+    if os.path.exists(path):
+        with open(path) as f:
+            previous_content = f.read()
+    try:
+        with open(path, 'w+') as f:
+            f.write(content)
+        yield
+    finally:
+        if previous_content is None:
+            os.remove(path)
+        else:
+            with open(path, 'w+') as f:
+                f.write(previous_content)
 
 
 # disable pytest-pep8 on 3.4 due to "No such file or directory: 'doc'" issue
@@ -131,7 +142,19 @@ if (sys.version_info[0] == 2 and sys.version_info >= (2, 7)) or (sys.version_inf
                 ServiceMessage('testFailed', {'name': test_name, 'message': test_message}),
                 ServiceMessage('testFinished', {'name': test_name}),
             ])
-        ms = assert_service_messages(output, expected)
+        seen_flake8_messages = set()
+
+        def first_flake8_message_occurrence(message):
+            message_name = message.params.get('name', '')
+            if not message_name.startswith('pep8: '):
+                return True
+            message_key = (message.name, message_name)
+            if message_key in seen_flake8_messages:
+                return False
+            seen_flake8_messages.add(message_key)
+            return True
+
+        ms = assert_service_messages(output, expected, actual_messages_predicate=first_flake8_message_occurrence)
         assert ms[2].params["details"].find(test_message.replace('|', '|||')) > 0
 
 
@@ -301,6 +324,7 @@ def test_output(venv):
             ServiceMessage('testStdErr', {'name': test_name, 'flowId': test_name, 'out': 'teardown stderr|n'}),
             ServiceMessage('blockClosed', {'name': 'test teardown'}),
         ])
+    assert "[100%]\n##teamcity[testStdOut" in output
 
 
 def test_class_with_method(venv):
@@ -350,6 +374,83 @@ def test_output_no_capture(venv):
     assert "test stdout" in output
     assert "teardown stderr" in output
     assert "teardown stdout" in output
+
+
+def test_logging_output_ignored_for_failed_test_by_default(venv):
+    output = run(venv, 'logging_output_test.py', test='test_log_on_failure')
+
+    test_name = 'tests.guinea-pigs.pytest.logging_output_test.test_log_on_failure'
+    assert_service_messages(
+        output,
+        [
+            ServiceMessage('testCount', {'count': "1"}),
+            ServiceMessage('testStarted', {'name': test_name, 'flowId': test_name}),
+            ServiceMessage('testFailed', {'flowId': test_name}),
+            ServiceMessage('testFinished', {'name': test_name, 'flowId': test_name}),
+        ])
+    assert "##teamcity[testStdOut" not in output
+    assert "##teamcity[testLog" not in output
+
+
+def test_logging_output_reported_as_test_log_with_programmatic_switch(venv):
+    output = run_with_programmatic_options(venv, 'logging_output_test.py', test='test_log_on_failure', report_logs_as_test_log=True)
+
+    test_name = 'tests.guinea-pigs.pytest.logging_output_test.test_log_on_failure'
+    messages = assert_service_messages(
+        output,
+        [
+            ServiceMessage('testCount', {'count': "1"}),
+            ServiceMessage('testStarted', {'name': test_name, 'flowId': test_name}),
+            ServiceMessage('testLog', {'flowId': test_name}),
+            ServiceMessage('testFailed', {'flowId': test_name}),
+            ServiceMessage('testFinished', {'name': test_name, 'flowId': test_name}),
+        ])
+
+    assert "pytest log warning" in messages[2].params["out"]
+    assert "##teamcity[testStdOut" not in output
+
+
+def test_logging_output_ignored_for_passed_test_by_default(venv):
+    output = run(venv, 'logging_output_test.py', test='test_log_on_success')
+
+    test_name = 'tests.guinea-pigs.pytest.logging_output_test.test_log_on_success'
+    assert_service_messages(
+        output,
+        [
+            ServiceMessage('testCount', {'count': "1"}),
+            ServiceMessage('testStarted', {'name': test_name, 'flowId': test_name}),
+            ServiceMessage('testFinished', {'name': test_name, 'flowId': test_name}),
+        ])
+    assert "pytest log warning" not in output
+
+
+def test_logging_output_skipped_for_passed_test_with_programmatic_default(venv):
+    output = run_with_programmatic_options(venv, 'logging_output_test.py', test='test_log_on_success', skip_passed_output=True)
+
+    test_name = 'tests.guinea-pigs.pytest.logging_output_test.test_log_on_success'
+    assert_service_messages(
+        output,
+        [
+            ServiceMessage('testCount', {'count': "1"}),
+            ServiceMessage('testStarted', {'name': test_name, 'flowId': test_name}),
+            ServiceMessage('testFinished', {'name': test_name, 'flowId': test_name}),
+        ])
+    assert "pytest log warning" not in output
+
+
+def test_logging_output_ignored_for_passed_test_when_ini_overrides_programmatic_default(venv):
+    with make_ini('[pytest]\nskippassedoutput=false'):
+        output = run_with_programmatic_options(venv, 'logging_output_test.py', test='test_log_on_success', skip_passed_output=True)
+
+    test_name = 'tests.guinea-pigs.pytest.logging_output_test.test_log_on_success'
+    assert_service_messages(
+        output,
+        [
+            ServiceMessage('testCount', {'count': "1"}),
+            ServiceMessage('testStarted', {'name': test_name, 'flowId': test_name}),
+            ServiceMessage('testFinished', {'name': test_name, 'flowId': test_name}),
+        ])
+    assert "pytest log warning" not in output
 
 
 def test_teardown_error(venv):
@@ -667,3 +768,29 @@ def run(venv, file_names, test=None, options='', set_tc_version=True, additional
     if additional_arguments:
         command += " " + additional_arguments
     return run_command(command, set_tc_version=set_tc_version, env=env)
+
+
+def run_with_programmatic_options(venv, file_names, test=None, skip_passed_output=False, report_logs_as_test_log=False):
+    if test is not None:
+        test_suffix = "::" + test
+    else:
+        test_suffix = ""
+
+    if not isinstance(file_names, list):
+        file_names = [file_names]
+
+    pytest_args = [
+        os.path.join('tests', 'guinea-pigs', 'pytest', file_name) + test_suffix
+        for file_name in file_names
+    ]
+    code = (
+        "import pytest, sys;"
+        "from teamcity import pytest_plugin;"
+        "pytest_plugin.set_skip_passed_output_default(%r);"
+        "pytest_plugin.set_report_logs_as_test_log(%r);"
+        "sys.exit(pytest.main(%r, plugins=[pytest_plugin]))"
+    ) % (skip_passed_output, report_logs_as_test_log, pytest_args)
+    command = subprocess.list2cmdline([os.path.join(venv.bin, 'python'), '-c', code])
+    env = virtual_environments.get_clean_system_environment()
+    env['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'
+    return run_command(command, env=env)
